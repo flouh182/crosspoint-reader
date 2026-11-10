@@ -1,0 +1,894 @@
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+index 72d5bb5..24aa01b 100644
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -610,6 +610,7 @@ STR_HOME_BUTTON_LONG_PRESS: "Long Press"
+ STR_TOGGLE_FRONTLIGHT: "Toggle Frontlight"
+ 
+ STR_THEME_COVER_GRID: "Cover Grid"
++STR_THEME_DASHBOARD: "Dashboard"
+ STR_WORD_SPACING: "Word Spacing"
+ STR_CHARACTER_SPACING: "Character Spacing"
+ STR_SPACING_MINUS_2: "-2 px"
+diff --git a/lib/I18n/translations/german.yaml b/lib/I18n/translations/german.yaml
+index 8c73ee7..dc6e1cc 100644
+--- a/lib/I18n/translations/german.yaml
++++ b/lib/I18n/translations/german.yaml
+@@ -472,6 +472,7 @@ STR_TEXT_AA: "Schriftglättung"
+ STR_TEXT_SETTINGS: "Texteinstellungen"
+ STR_THEME_CLASSIC: "Klassisch"
+ STR_THEME_COVER_GRID: "Cover Raster"
++STR_THEME_DASHBOARD: "Dashboard"
+ STR_THEME_LYRA_EXTENDED: "Lyra Extended"
+ STR_THEME_LYRA: "Lyra"
+ STR_THEME_ROUNDEDRAFF: "RoundedRaff"
+diff --git a/src/CrossPointSettings.h b/src/CrossPointSettings.h
+index 68a1d99..e1a4dba 100644
+--- a/src/CrossPointSettings.h
++++ b/src/CrossPointSettings.h
+@@ -202,7 +202,7 @@ class CrossPointSettings : public PersistableStore<CrossPointSettings> {
+   };
+ 
+   // UI Theme
+-  enum UI_THEME { CLASSIC = 0, LYRA = 1, LYRA_3_COVERS = 2, ROUNDEDRAFF = 3, COVER_GRID = 4 };
++  enum UI_THEME { CLASSIC = 0, LYRA = 1, LYRA_3_COVERS = 2, ROUNDEDRAFF = 3, COVER_GRID = 4, DASHBOARD = 5 };
+ 
+   // Image rendering in EPUB reader. IMAGES_DISPLAY_BW lays images out like
+   // IMAGES_DISPLAY but draws them as a B/W dither, so image pages skip the
+diff --git a/src/ReadingStats.cpp b/src/ReadingStats.cpp
+new file mode 100644
+index 0000000..82a80b4
+--- /dev/null
++++ b/src/ReadingStats.cpp
+@@ -0,0 +1,102 @@
++#include "ReadingStats.h"
++
++#include <Arduino.h>
++#include <HalClock.h>
++#include <HalStorage.h>
++#include <Logging.h>
++
++#include <cstring>
++#include <ctime>
++
++#include "util/CivilDate.h"
++
++ReadingStats readingStats;
++
++namespace {
++constexpr const char* STATS_DIR = "/.crosspoint";
++constexpr const char* STATS_PATH = "/.crosspoint/reading_stats.bin";
++constexpr const char* STATS_TMP = "/.crosspoint/reading_stats.bin.tmp";
++constexpr uint32_t MIN_SESSION_SECONDS = 10;  // ignore accidental opens
++}  // namespace
++
++int ReadingStats::todayNumber() {
++  struct tm t;
++  if (!halClock.isAvailable() || !halClock.localTime(t)) return -1;
++  return civil::daysFromCivil(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
++}
++
++void ReadingStats::ensureLoaded() {
++  if (loaded) return;
++  loaded = true;
++  for (auto& e : entries) e = {-1, 0};
++
++  HalFile f;
++  if (!Storage.openFileForRead("STATS", STATS_PATH, f)) return;
++  FileData data;
++  if (f.read(&data, sizeof(data)) != static_cast<int>(sizeof(data)) || data.magic != MAGIC) {
++    LOG_ERR("STATS", "Ignoring unreadable stats file");
++    return;
++  }
++  memcpy(entries, data.entries, sizeof(entries));
++}
++
++void ReadingStats::add(int day, uint32_t seconds) {
++  int slot = -1;
++  int oldest = 0;
++  for (int i = 0; i < KEPT_DAYS; i++) {
++    if (entries[i].day == day) {
++      slot = i;
++      break;
++    }
++    if (entries[i].day < entries[oldest].day) oldest = i;
++  }
++  if (slot < 0) {
++    slot = oldest;  // an empty slot (day = -1) is always the "oldest"
++    entries[slot] = {day, 0};
++  }
++  entries[slot].seconds += seconds;
++}
++
++void ReadingStats::save() {
++  FileData data;
++  data.magic = MAGIC;
++  memcpy(data.entries, entries, sizeof(entries));
++
++  Storage.mkdir(STATS_DIR);
++  {
++    HalFile f;
++    if (!Storage.openFileForWrite("STATS", STATS_TMP, f)) return;
++    if (f.write(reinterpret_cast<const uint8_t*>(&data), sizeof(data)) != sizeof(data)) {
++      LOG_ERR("STATS", "Short write saving reading stats");
++      return;
++    }
++    f.flush();
++  }
++  Storage.remove(STATS_PATH);
++  if (!Storage.rename(STATS_TMP, STATS_PATH)) LOG_ERR("STATS", "Failed to move stats file into place");
++}
++
++void ReadingStats::beginSession() {
++  inSession = true;
++  sessionStartMs = millis();
++}
++
++void ReadingStats::endSession() {
++  if (!inSession) return;
++  inSession = false;
++  const uint32_t elapsed = static_cast<uint32_t>((millis() - sessionStartMs) / 1000UL);
++  if (elapsed < MIN_SESSION_SECONDS) return;
++  const int today = todayNumber();
++  if (today < 0) return;  // no clock: cannot attribute the time to a day
++  ensureLoaded();
++  add(today, elapsed);
++  save();
++}
++
++uint32_t ReadingStats::secondsOnDay(int dayNumber) {
++  ensureLoaded();
++  for (const auto& e : entries) {
++    if (e.day == dayNumber) return e.seconds;
++  }
++  return 0;
++}
+diff --git a/src/ReadingStats.h b/src/ReadingStats.h
+new file mode 100644
+index 0000000..75a586b
+--- /dev/null
++++ b/src/ReadingStats.h
+@@ -0,0 +1,44 @@
++#pragma once
++
++#include <cstdint>
++
++// Counts time spent inside the reader, per local calendar day, for the
++// Dashboard home's "this week" widget. Persisted to /.crosspoint/reading_stats.bin
++// (last 14 days only, so the file stays tiny).
++class ReadingStats {
++ public:
++  static constexpr int KEPT_DAYS = 14;
++
++  // Called from ReaderActivity::onEnter / onExit.
++  void beginSession();
++  void endSession();
++
++  // Seconds read on the given day number (see civil::daysFromCivil), 0 if none.
++  uint32_t secondsOnDay(int dayNumber);
++
++  // Day number of "today" in local time, or -1 when the clock is unavailable.
++  static int todayNumber();
++
++ private:
++  struct Entry {
++    int32_t day;
++    uint32_t seconds;
++  };
++  struct FileData {
++    uint32_t magic;
++    Entry entries[KEPT_DAYS];
++  };
++  static constexpr uint32_t MAGIC = 0x41545352;  // "RSTA"
++
++  Entry entries[KEPT_DAYS];
++  bool loaded = false;
++  bool inSession = false;
++  unsigned long sessionStartMs = 0;
++
++  void ensureLoaded();
++  void add(int day, uint32_t seconds);
++  void save();
++};
++
++extern ReadingStats readingStats;
++#define READING_STATS readingStats
+diff --git a/src/SettingsList.h b/src/SettingsList.h
+index 4832128..4c530ea 100644
+--- a/src/SettingsList.h
++++ b/src/SettingsList.h
+@@ -251,9 +251,11 @@ inline SettingInfo buildShortPowerButtonSetting() {
+ 
+ inline std::vector<StrId> homeThemeValues() {
+   static constexpr StrId VALUES[] = {StrId::STR_THEME_CLASSIC, StrId::STR_THEME_LYRA, StrId::STR_THEME_LYRA_EXTENDED,
+-                                     StrId::STR_THEME_ROUNDEDRAFF, StrId::STR_THEME_COVER_GRID};
+-  const size_t count = UITheme::supportsCoverGrid() ? std::size(VALUES) : std::size(VALUES) - 1;
+-  return {VALUES, VALUES + count};
++                                     StrId::STR_THEME_ROUNDEDRAFF, StrId::STR_THEME_COVER_GRID,
++                                     StrId::STR_THEME_DASHBOARD};
++  // Entry order must match CrossPointSettings::UI_THEME. Cover Grid falls back
++  // to Lyra on boards that do not support it (see UITheme::setTheme).
++  return {VALUES, VALUES + std::size(VALUES)};
+ }
+ 
+ using SettingVisitor = void (*)(void* context, SettingInfo& info);
+diff --git a/src/activities/home/HomeActivity.cpp b/src/activities/home/HomeActivity.cpp
+index 1583fa7..1236827 100644
+--- a/src/activities/home/HomeActivity.cpp
++++ b/src/activities/home/HomeActivity.cpp
+@@ -4,6 +4,7 @@
+ #include <Epub.h>
+ #include <FsHelpers.h>
+ #include <GfxRenderer.h>
++#include <HalClock.h>
+ #include <HalDisplay.h>
+ #include <HalStorage.h>
+ #include <I18n.h>
+@@ -23,6 +24,7 @@
+ #include "MappedInputManager.h"
+ #include "OpdsServerStore.h"
+ #include "RecentBooksStore.h"
++#include "components/DashboardHome.h"
+ #include "components/UITheme.h"
+ #include "fontIds.h"
+ 
+@@ -251,6 +253,11 @@ void HomeActivity::onEnter() {
+ 
+   const auto base = static_cast<int>(recentBooks.size());
+   selectorIndex = initialMenuItem == HomeMenuItem::NONE ? 0 : base + menuItemToIndex(initialMenuItem, hasLibrarySlot());
++  if (dashboardActive()) {
++    selectorIndex = initialMenuItem == HomeMenuItem::SETTINGS_MENU ? DashboardHome::TILE_SETTINGS : DashboardHome::TILE_BOOKSHELF;
++    uint8_t h = 0, m = 255;
++    if (halClock.isAvailable() && halClock.getTime(h, m)) lastDrawnMinute = m;
++  }
+ 
+   // Trigger first update
+   requestUpdate();
+@@ -303,6 +310,10 @@ void HomeActivity::freeCoverBuffer() {
+ }
+ 
+ void HomeActivity::loop() {
++  if (dashboardActive()) {
++    loopDashboard();
++    return;
++  }
+   const int menuCount = getMenuItemCount();
+   const auto& metrics = UITheme::getInstance().getMetrics();
+ 
+@@ -473,6 +484,10 @@ void HomeActivity::render(RenderLock&&) {
+   const Rect content = UITheme::getInstance().getContentArea(renderer);
+ 
+   renderer.clearScreen();
++  if (dashboardActive()) {
++    renderDashboard();
++    return;
++  }
+   if (coverGridUi) {
+     const auto drawGrid = [&] {
+       renderer.clearScreen();
+@@ -592,3 +607,72 @@ void HomeActivity::onFileTransferOpen() { activityManager.goToFileTransfer(); }
+ void HomeActivity::onOpdsBrowserOpen() { activityManager.goToBrowser(); }
+ 
+ void HomeActivity::onPluginsOpen() { activityManager.goToPlugins(hasOpdsServers); }
++
++// ---------------------------------------------------------------------------
++// Dashboard theme (see components/DashboardHome.*)
++// ---------------------------------------------------------------------------
++
++bool HomeActivity::dashboardActive() const {
++  // Portrait only: the tile layout is designed for the tall screen.
++  return UITheme::getInstance().hasDashboardHome() && renderer.getScreenWidth() < renderer.getScreenHeight();
++}
++
++void HomeActivity::loopDashboard() {
++  buttonNavigator.onNext([this] {
++    selectorIndex = ButtonNavigator::nextIndex(selectorIndex, DashboardHome::TILE_COUNT);
++    requestUpdate();
++  });
++  buttonNavigator.onPrevious([this] {
++    selectorIndex = ButtonNavigator::previousIndex(selectorIndex, DashboardHome::TILE_COUNT);
++    requestUpdate();
++  });
++
++  // Back keeps its usual home behaviour: resume the most recent book.
++  if (mappedInput.wasReleased(MappedInputManager::Button::Back) && hasContinueReading && !recentBooks.empty()) {
++    onRecentBookSelected(recentBooks[0].path);
++    return;
++  }
++
++  // Touch boards (X4 Pro): tapping a tile opens it directly.
++  int tapX = 0, tapY = 0;
++  if (mappedInput.wasScreenTapped(tapX, tapY)) {
++    const int tile = DashboardHome::tileAt(renderer, tapX, tapY);
++    if (tile >= 0) {
++      selectorIndex = tile;
++      if (tile == DashboardHome::TILE_SETTINGS) {
++        onSettingsOpen();
++      } else {
++        onLibraryOpen();
++      }
++      return;
++    }
++  }
++
++  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
++    if (selectorIndex == DashboardHome::TILE_SETTINGS) {
++      onSettingsOpen();
++    } else {
++      onLibraryOpen();
++    }
++    return;
++  }
++
++  // Keep the clock honest: redraw when the minute changes. (One partial
++  // refresh per minute while Home is open; the device still auto-sleeps.)
++  uint8_t h = 0, m = 0;
++  if (halClock.isAvailable() && halClock.getTime(h, m) && m != lastDrawnMinute) {
++    lastDrawnMinute = m;
++    requestUpdate();
++  }
++}
++
++void HomeActivity::renderDashboard() {
++  DashboardHome::draw(renderer, selectorIndex);
++
++  const auto labels = mappedInput.mapLabels(hasContinueReading ? tr(STR_RESUME) : "", tr(STR_SELECT), tr(STR_DIR_UP),
++                                            tr(STR_DIR_DOWN));
++  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
++
++  renderer.displayBuffer(cleanInitialRefresh && !firstRenderDone ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH);
++  firstRenderDone = true;
++}
+diff --git a/src/activities/home/HomeActivity.h b/src/activities/home/HomeActivity.h
+index 84e26cb..f91cb56 100644
+--- a/src/activities/home/HomeActivity.h
++++ b/src/activities/home/HomeActivity.h
+@@ -14,6 +14,12 @@ class HomeActivity final : public Activity {
+   std::unique_ptr<CoverGridHomeUi> coverGridUi;
+   ButtonNavigator buttonNavigator;
+   int selectorIndex = 0;
++
++  // Dashboard theme: separate input/render path, see components/DashboardHome.
++  uint8_t lastDrawnMinute = 255;
++  bool dashboardActive() const;
++  void loopDashboard();
++  void renderDashboard();
+   bool recentsLoading = false;
+   bool recentsLoaded = false;
+   bool firstRenderDone = false;
+diff --git a/src/activities/reader/ReaderActivity.cpp b/src/activities/reader/ReaderActivity.cpp
+index 12584d1..05fca42 100644
+--- a/src/activities/reader/ReaderActivity.cpp
++++ b/src/activities/reader/ReaderActivity.cpp
+@@ -15,6 +15,7 @@
+ #include "CrossPointState.h"
+ #include "EpubReaderActivity.h"
+ #include "ReaderUtils.h"
++#include "ReadingStats.h"
+ #include "RecentBooksStore.h"
+ #include "SdCardFontSystem.h"
+ #include "XtcReaderActivity.h"
+@@ -81,6 +82,7 @@ void ReaderActivity::onEnter() {
+     return;
+   }
+ 
++  READING_STATS.beginSession();
+   requestUpdate();
+ }
+ 
+@@ -97,6 +99,8 @@ void ReaderActivity::rememberBookOnceRendered() {
+ void ReaderActivity::onExit() {
+   Activity::onExit();
+ 
++  READING_STATS.endSession();
++
+   // Keep rebuildable font buffers from pinning the heap between reading sessions.
+   if (auto* fontCache = renderer.getFontCacheManager()) {
+     fontCache->releaseSdFontCaches();
+diff --git a/src/components/DashboardHome.cpp b/src/components/DashboardHome.cpp
+new file mode 100644
+index 0000000..38df8e6
+--- /dev/null
++++ b/src/components/DashboardHome.cpp
+@@ -0,0 +1,356 @@
++#include "DashboardHome.h"
++
++#include <GfxRenderer.h>
++#include <HalClock.h>
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <ctime>
++
++#include "CrossPointSettings.h"
++#include "ReadingStats.h"
++#include "components/UITheme.h"
++#include "components/icons/library.h"
++#include "components/icons/settings2.h"
++#include "fontIds.h"
++#include "util/CivilDate.h"
++#include "util/SunTimes.h"
++
++namespace {
++
++// German labels. Edit these arrays for another language.
++const char* const kMonths[12] = {"Januar", "Februar", "Maerz",     "April",   "Mai",      "Juni",
++                                 "Juli",   "August",  "September", "Oktober", "November", "Dezember"};
++const char* const kWeekdayShort[7] = {"Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"};
++const char* const kWeekLetters[7] = {"M", "D", "M", "D", "F", "S", "S"};
++const char* const kTileBookshelf = "Bibliothek";
++const char* const kTileSettings = "Einstellungen";
++const char* const kThisWeek = "Diese Woche";
++const char* const kSunrise = "Aufgang";
++const char* const kSunset = "Untergang";
++
++constexpr int kGap = 8;
++constexpr int kFrameRadius = 10;
++
++struct Clock {
++  bool valid = false;
++  struct tm t {};
++};
++
++// UTC offset (minutes) currently in effect for the configured timezone,
++// derived from the same local time the clock shows.
++int utcOffsetMinutes(const struct tm& local) {
++  struct tm copy = local;
++  const time_t epoch = mktime(&copy);  // interprets `copy` under the active TZ rule
++  struct tm utc {};
++  gmtime_r(&epoch, &utc);
++  int diff = (local.tm_hour - utc.tm_hour) * 60 + (local.tm_min - utc.tm_min);
++  const int dayDiff = local.tm_yday - utc.tm_yday;
++  if (dayDiff == 1 || dayDiff < -1) diff += 1440;
++  if (dayDiff == -1 || dayDiff > 1) diff -= 1440;
++  return diff;
++}
++
++void frame(const GfxRenderer& r, int x, int y, int w, int h, int lineWidth = 2) {
++  r.drawRoundedRect(x, y, w, h, lineWidth, kFrameRadius, true);
++}
++
++void drawCentered(const GfxRenderer& r, int fontId, int cx, int y, const char* text, bool black = true,
++                  EpdFontFamily::Style style = EpdFontFamily::REGULAR) {
++  r.drawText(fontId, cx - r.getTextWidth(fontId, text, style) / 2, y, text, black, style);
++}
++
++// ---------------------------------------------------------------- calendar
++void drawCalendar(const GfxRenderer& r, int x, int y, int w, int h, const Clock& clk) {
++  const int cellW = w / 7;
++  const int cellH = std::min(h / 7, r.getLineHeight(SMALL_FONT_ID) + 14);
++  const int lh = r.getLineHeight(SMALL_FONT_ID);
++
++  for (int i = 0; i < 7; i++) {
++    drawCentered(r, SMALL_FONT_ID, x + i * cellW + cellW / 2, y + (cellH - lh) / 2, kWeekLetters[i], true,
++                 EpdFontFamily::BOLD);
++  }
++  if (!clk.valid) return;
++
++  const int year = clk.t.tm_year + 1900;
++  const int month = clk.t.tm_mon + 1;
++  const int firstIdx = civil::weekdayMonFirst(civil::daysFromCivil(year, month, 1));
++  const int dim = civil::daysInMonth(year, month);
++
++  for (int d = 1; d <= dim; d++) {
++    const int idx = firstIdx + d - 1;
++    const int cx = x + (idx % 7) * cellW;
++    const int cy = y + (idx / 7 + 1) * cellH;
++    char num[4];
++    snprintf(num, sizeof(num), "%d", d);
++    if (d == clk.t.tm_mday) {
++      r.fillRect(cx + 1, cy + 1, cellW - 2, cellH - 2, true);
++      drawCentered(r, SMALL_FONT_ID, cx + cellW / 2, cy + (cellH - lh) / 2, num, false, EpdFontFamily::BOLD);
++    } else {
++      drawCentered(r, SMALL_FONT_ID, cx + cellW / 2, cy + (cellH - lh) / 2, num);
++    }
++  }
++}
++
++// --------------------------------------------------------------- flip clock
++// Seven-segment masks, bit order a b c d e f g (0 = a ... 6 = g). 10 = dash.
++constexpr uint8_t kSegMask[11] = {63, 6, 91, 79, 102, 109, 125, 7, 127, 111, 64};
++
++void drawSegDigit(const GfxRenderer& r, int x, int y, int dw, int dh, int t, int digit) {
++  const uint8_t m = kSegMask[digit < 0 || digit > 10 ? 10 : digit];
++  const int half = (dh - 3 * t) / 2;
++  if (m & 1) r.fillRect(x + t, y, dw - 2 * t, t, true);                         // a
++  if (m & 2) r.fillRect(x + dw - t, y + t, t, half, true);                      // b
++  if (m & 4) r.fillRect(x + dw - t, y + 2 * t + half, t, half, true);          // c
++  if (m & 8) r.fillRect(x + t, y + dh - t, dw - 2 * t, t, true);               // d
++  if (m & 16) r.fillRect(x, y + 2 * t + half, t, half, true);                  // e
++  if (m & 32) r.fillRect(x, y + t, t, half, true);                             // f
++  if (m & 64) r.fillRect(x + t, y + t + half, dw - 2 * t, t, true);            // g
++}
++
++void drawFlipCard(const GfxRenderer& r, int x, int y, int w, int h, int value /*0-99, -1 = dashes*/) {
++  frame(r, x, y, w, h);
++  const int pad = 9;
++  const int dw = (w - 3 * pad) / 2;
++  const int dh = h - 2 * pad;
++  const int t = std::max(4, dw / 4);
++  const int tens = value < 0 ? 10 : value / 10;
++  const int ones = value < 0 ? 10 : value % 10;
++  drawSegDigit(r, x + pad, y + pad, dw, dh, t, tens);
++  drawSegDigit(r, x + 2 * pad + dw, y + pad, dw, dh, t, ones);
++  // The "hinge" of the flip card.
++  r.fillRect(x + 2, y + h / 2 - 1, w - 4, 2, false);
++}
++
++void drawClock(const GfxRenderer& r, int x, int y, int w, int h, const Clock& clk) {
++  const int lh = r.getLineHeight(UI_10_FONT_ID);
++  const int dateH = lh + 10;
++  const int cardsH = h - dateH - 4;
++  const int cardW = (w - 6) / 2;
++
++  int hour = -1, minute = -1;
++  if (clk.valid) {
++    hour = clk.t.tm_hour;
++    minute = clk.t.tm_min;
++    if (SETTINGS.clockFormat == 1) {  // 12h mode
++      hour %= 12;
++      if (hour == 0) hour = 12;
++    }
++  }
++  drawFlipCard(r, x, y, cardW, cardsH, hour);
++  drawFlipCard(r, x + cardW + 6, y, cardW, cardsH, minute);
++
++  const int lineY = y + cardsH + 4;
++  r.drawLine(x, lineY, x + w, lineY, true);
++  char date[12] = "--.--.";
++  const char* wd = "--";
++  if (clk.valid) {
++    snprintf(date, sizeof(date), "%02d.%02d.", clk.t.tm_mday, clk.t.tm_mon + 1);
++    wd = kWeekdayShort[(clk.t.tm_wday + 6) % 7];
++  }
++  r.drawText(UI_10_FONT_ID, x + 2, lineY + 4, date);
++  r.drawText(UI_10_FONT_ID, x + w - r.getTextWidth(UI_10_FONT_ID, wd) - 2, lineY + 4, wd);
++}
++
++// --------------------------------------------------------- weekly reading
++void drawStats(const GfxRenderer& r, int x, int y, int w, int h, const Clock& clk) {
++  frame(r, x, y, w, h);
++  const int pad = 10;
++  const int lhS = r.getLineHeight(SMALL_FONT_ID);
++  const int lhB = r.getLineHeight(UI_12_FONT_ID);
++
++  uint32_t secs[7] = {0, 0, 0, 0, 0, 0, 0};
++  int todayIdx = -1;
++  if (clk.valid) {
++    const int today = civil::daysFromCivil(clk.t.tm_year + 1900, clk.t.tm_mon + 1, clk.t.tm_mday);
++    todayIdx = civil::weekdayMonFirst(today);
++    for (int i = 0; i < 7; i++) secs[i] = READING_STATS.secondsOnDay(today - todayIdx + i);
++  }
++  uint32_t total = 0, best = 0;
++  for (int i = 0; i < 7; i++) {
++    total += secs[i];
++    best = std::max(best, secs[i]);
++  }
++  const uint32_t scale = std::max<uint32_t>(best, 30 * 60);  // full bar = max(best day, 30 min)
++
++  r.drawText(SMALL_FONT_ID, x + pad, y + pad, kThisWeek);
++  char val[16];
++  snprintf(val, sizeof(val), "%u min", static_cast<unsigned>(total / 60));
++  r.drawText(UI_12_FONT_ID, x + pad, y + pad + lhS, val, true, EpdFontFamily::BOLD);
++
++  const int barsTop = y + pad + lhS + lhB + 8;
++  const int barsBottom = y + h - pad - lhS - 3;
++  const int barH = std::max(10, barsBottom - barsTop);
++  const int gap = 3;
++  const int barW = (w - 2 * pad - 6 * gap) / 7;
++  for (int i = 0; i < 7; i++) {
++    const int bx = x + pad + i * (barW + gap);
++    r.drawRoundedRect(bx, barsTop, barW, barH, 1, 3, true);
++    if (secs[i] > 0) {
++      const int fill = std::max(3, static_cast<int>((barH - 4) * std::min<uint32_t>(secs[i], scale) / scale));
++      r.fillRect(bx + 2, barsTop + barH - 2 - fill, barW - 4, fill, true);
++    }
++    drawCentered(r, SMALL_FONT_ID, bx + barW / 2, barsBottom + 3, kWeekLetters[i], true,
++                 i == todayIdx ? EpdFontFamily::BOLD : EpdFontFamily::REGULAR);
++  }
++}
++
++// ------------------------------------------------------------------- tiles
++void drawTile(const GfxRenderer& r, int x, int y, int w, int h, const uint8_t* icon, const char* label,
++              bool selected) {
++  frame(r, x, y, w, h, selected ? 5 : 2);
++  const int lh = r.getLineHeight(UI_10_FONT_ID);
++  const int iconSize = 32;
++  const int blockH = iconSize + 10 + lh;
++  const int top = y + (h - blockH) / 2;
++  r.drawIcon(icon, x + (w - iconSize) / 2, top, iconSize);
++  drawCentered(r, UI_10_FONT_ID, x + w / 2, top + iconSize + 10, label);
++}
++
++// --------------------------------------------------------------------- sun
++void drawOctagon(const GfxRenderer& r, int cx, int cy, int rad) {
++  int xs[8], ys[8];
++  for (int i = 0; i < 8; i++) {
++    const double a = 3.14159265358979 / 4.0 * i + 3.14159265358979 / 8.0;
++    xs[i] = cx + static_cast<int>(std::lround(std::cos(a) * rad));
++    ys[i] = cy + static_cast<int>(std::lround(std::sin(a) * rad));
++  }
++  r.fillPolygon(xs, ys, 8, true);
++}
++
++void formatHm(char* buf, size_t n, int minutes) {
++  minutes = ((minutes % 1440) + 1440) % 1440;
++  snprintf(buf, n, "%02d:%02d", minutes / 60, minutes % 60);
++}
++
++void drawSun(const GfxRenderer& r, int x, int y, int w, int h, const Clock& clk) {
++  frame(r, x, y, w, h);
++  const int pad = 10;
++  const int lhS = r.getLineHeight(SMALL_FONT_ID);
++  const int lhB = r.getLineHeight(UI_12_FONT_ID);
++
++  SunTimes sun;
++  int nowMin = -1;
++  char date[12] = "--.--.";
++  if (clk.valid) {
++    sun = computeSunTimes(DashboardHome::LATITUDE, DashboardHome::LONGITUDE, clk.t.tm_year + 1900, clk.t.tm_mon + 1,
++                          clk.t.tm_mday, utcOffsetMinutes(clk.t));
++    nowMin = clk.t.tm_hour * 60 + clk.t.tm_min;
++    snprintf(date, sizeof(date), "%02d.%02d.", clk.t.tm_mday, clk.t.tm_mon + 1);
++  }
++  r.drawText(SMALL_FONT_ID, x + pad, y + pad, date);
++
++  const int timesY = y + h - pad - lhB;
++  const int labelsY = timesY - lhS;
++  const int curveTop = y + pad + lhS + 6;
++  const int baseY = labelsY - 8;
++  const int amp = std::max(12, baseY - curveTop - 4);
++  const int x0 = x + pad + 4;
++  const int x1 = x + w - pad - 4;
++  const double kPi = 3.14159265358979;
++
++  r.drawLine(x0 - 4, baseY, x1 + 4, baseY, true);
++  constexpr int kSteps = 24;
++  int px = x0, py = baseY;
++  for (int i = 1; i <= kSteps; i++) {
++    const int nx = x0 + (x1 - x0) * i / kSteps;
++    const int ny = baseY - static_cast<int>(std::lround(amp * std::sin(kPi * i / kSteps)));
++    r.drawLine(px, py, nx, ny, 2, true);
++    px = nx;
++    py = ny;
++  }
++  if (sun.valid && nowMin >= sun.riseMin && nowMin <= sun.setMin && sun.setMin > sun.riseMin) {
++    const double f = static_cast<double>(nowMin - sun.riseMin) / (sun.setMin - sun.riseMin);
++    drawOctagon(r, x0 + static_cast<int>((x1 - x0) * f), baseY - static_cast<int>(std::lround(amp * std::sin(kPi * f))), 6);
++  }
++
++  char rise[8] = "--:--", set[8] = "--:--";
++  if (sun.valid) {
++    formatHm(rise, sizeof(rise), sun.riseMin);
++    formatHm(set, sizeof(set), sun.setMin);
++  }
++  r.drawText(SMALL_FONT_ID, x + pad, labelsY, kSunrise);
++  r.drawText(UI_12_FONT_ID, x + pad, timesY, rise, true, EpdFontFamily::BOLD);
++  const int rightX = x + w - pad;
++  r.drawText(SMALL_FONT_ID, rightX - r.getTextWidth(SMALL_FONT_ID, kSunset), labelsY, kSunset);
++  r.drawText(UI_12_FONT_ID, rightX - r.getTextWidth(UI_12_FONT_ID, set, EpdFontFamily::BOLD), timesY, set, true,
++             EpdFontFamily::BOLD);
++}
++
++}  // namespace
++
++namespace {
++
++struct Box {
++  int x, y, w, h;
++};
++
++struct Layout {
++  Box calendar, clock, stats, bookshelf, sun, settings;
++};
++
++Layout computeLayout(const GfxRenderer& r) {
++  const auto& metrics = UITheme::getInstance().getMetrics();
++  const int H = r.getScreenHeight();
++  const Rect content = UITheme::getInstance().getContentArea(r);
++
++  const int left = content.x + 10;
++  const int usableW = content.width - 20;
++  const int top = metrics.topPadding + metrics.headerHeight + 6;
++  // buttonHintsHeight is 0 on touch boards, so the grid grows to the bottom edge there.
++  const int bottom = H - metrics.buttonHintsHeight - 6;
++  const int totalH = bottom - top;
++
++  const int h1 = totalH * 38 / 100;
++  const int h2 = (totalH - h1 - 2 * kGap) / 2;
++  const int y1 = top;
++  const int y2 = y1 + h1 + kGap;
++  const int y3 = y2 + h2 + kGap;
++
++  const int w1L = usableW * 55 / 100;  // calendar | clock
++  const int w2L = usableW * 45 / 100;  // stats | bookshelf
++  const int w3L = usableW * 52 / 100;  // sun | settings
++
++  Layout l;
++  l.calendar = {left, y1, w1L, h1};
++  l.clock = {left + w1L + kGap, y1, usableW - w1L - kGap, h1};
++  l.stats = {left, y2, w2L, h2};
++  l.bookshelf = {left + w2L + kGap, y2, usableW - w2L - kGap, h2};
++  l.sun = {left, y3, w3L, h2};
++  l.settings = {left + w3L + kGap, y3, usableW - w3L - kGap, h2};
++  return l;
++}
++
++bool contains(const Box& b, int x, int y) { return x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h; }
++
++}  // namespace
++
++int DashboardHome::tileAt(const GfxRenderer& r, int x, int y) {
++  const Layout l = computeLayout(r);
++  if (contains(l.bookshelf, x, y)) return TILE_BOOKSHELF;
++  if (contains(l.settings, x, y)) return TILE_SETTINGS;
++  return -1;
++}
++
++void DashboardHome::draw(GfxRenderer& r, int selectedTile) {
++  const auto& metrics = UITheme::getInstance().getMetrics();
++  const int W = r.getScreenWidth();
++
++  Clock clk;
++  clk.valid = halClock.isAvailable() && halClock.localTime(clk.t);
++
++  char title[32] = "Start";
++  if (clk.valid) snprintf(title, sizeof(title), "%s %d", kMonths[clk.t.tm_mon], clk.t.tm_year + 1900);
++  GUI.drawHeader(r, Rect{0, metrics.topPadding, W, metrics.headerHeight}, title, nullptr, false);
++
++  const Layout l = computeLayout(r);
++  drawCalendar(r, l.calendar.x, l.calendar.y, l.calendar.w, l.calendar.h, clk);
++  drawClock(r, l.clock.x, l.clock.y, l.clock.w, l.clock.h, clk);
++  drawStats(r, l.stats.x, l.stats.y, l.stats.w, l.stats.h, clk);
++  drawTile(r, l.bookshelf.x, l.bookshelf.y, l.bookshelf.w, l.bookshelf.h, LibraryIcon, kTileBookshelf,
++           selectedTile == TILE_BOOKSHELF);
++  drawSun(r, l.sun.x, l.sun.y, l.sun.w, l.sun.h, clk);
++  drawTile(r, l.settings.x, l.settings.y, l.settings.w, l.settings.h, Settings2Icon, kTileSettings,
++           selectedTile == TILE_SETTINGS);
++}
+diff --git a/src/components/DashboardHome.h b/src/components/DashboardHome.h
+new file mode 100644
+index 0000000..a09ac70
+--- /dev/null
++++ b/src/components/DashboardHome.h
+@@ -0,0 +1,25 @@
++#pragma once
++
++class GfxRenderer;
++
++// "Dashboard" start screen: month calendar, flip clock, weekly reading time,
++// Bookshelf / Settings tiles and sunrise/sunset. Portrait only.
++namespace DashboardHome {
++
++constexpr int TILE_BOOKSHELF = 0;
++constexpr int TILE_SETTINGS = 1;
++constexpr int TILE_COUNT = 2;
++
++// Location used for sunrise/sunset (Duesseldorf). Change for another city.
++constexpr float LATITUDE = 51.2277f;
++constexpr float LONGITUDE = 6.7735f;
++
++// Draws the whole screen (header included) into the framebuffer. The caller
++// clears the screen beforehand and draws the button hints / refreshes after.
++void draw(GfxRenderer& renderer, int selectedTile);
++
++// Touch: the tile (TILE_*) under a tap at logical screen point (x, y), or -1.
++// Uses exactly the rectangles draw() paints.
++int tileAt(const GfxRenderer& renderer, int x, int y);
++
++}  // namespace DashboardHome
+diff --git a/src/components/UITheme.cpp b/src/components/UITheme.cpp
+index b23f46d..b1f5719 100644
+--- a/src/components/UITheme.cpp
++++ b/src/components/UITheme.cpp
+@@ -34,6 +34,8 @@ bool UITheme::supportsCoverGrid() { return HalMemory::getPsramHeap().totalBytes
+ 
+ bool UITheme::hasCoverGridHome() { return SETTINGS.uiTheme == CrossPointSettings::COVER_GRID && supportsCoverGrid(); }
+ 
++bool UITheme::hasDashboardHome() { return SETTINGS.uiTheme == CrossPointSettings::DASHBOARD; }
++
+ void UITheme::drawCoverGridHome(CoverGridHomeUi& home) { home.renderUi(); }
+ 
+ void UITheme::setTheme(CrossPointSettings::UI_THEME type) {
+@@ -46,6 +48,7 @@ void UITheme::setTheme(CrossPointSettings::UI_THEME type) {
+       currentMetrics = &BaseMetrics::values;
+       break;
+     case CrossPointSettings::UI_THEME::COVER_GRID:
++    case CrossPointSettings::UI_THEME::DASHBOARD:  // home is drawn by DashboardHome; other screens use Lyra
+     case CrossPointSettings::UI_THEME::LYRA: {
+       // The cover home owns its screen-lifetime UI state; other screens retain Lyra styling.
+       auto theme = makeUniqueNoThrow<LyraTheme>();
+diff --git a/src/components/UITheme.h b/src/components/UITheme.h
+index 06853bd..44c409e 100644
+--- a/src/components/UITheme.h
++++ b/src/components/UITheme.h
+@@ -43,6 +43,7 @@ class UITheme {
+                                       TextVerticalAlignment verticalAlignment = TextVerticalAlignment::CENTER);
+   static bool supportsCoverGrid();
+   static bool hasCoverGridHome();
++  static bool hasDashboardHome();
+   static void drawCoverGridHome(CoverGridHomeUi& home);
+   void reload();
+   void setTheme(CrossPointSettings::UI_THEME type);
+diff --git a/src/util/CivilDate.h b/src/util/CivilDate.h
+new file mode 100644
+index 0000000..6603f6b
+--- /dev/null
++++ b/src/util/CivilDate.h
+@@ -0,0 +1,33 @@
++#pragma once
++
++// Small calendar helpers shared by the Dashboard home and the reading stats.
++
++namespace civil {
++
++inline bool isLeap(int y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
++
++inline int daysInMonth(int year, int month /*1-12*/) {
++  static const int d[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
++  return (month == 2 && isLeap(year)) ? 29 : d[month - 1];
++}
++
++// Days since 1970-01-01 (proleptic Gregorian). Used as a stable per-day key.
++inline int daysFromCivil(int y, int m /*1-12*/, int d) {
++  y -= m <= 2;
++  const int era = (y >= 0 ? y : y - 399) / 400;
++  const unsigned yoe = static_cast<unsigned>(y - era * 400);
++  const unsigned mp = static_cast<unsigned>(m > 2 ? m - 3 : m + 9);
++  const unsigned doy = (153 * mp + 2) / 5 + static_cast<unsigned>(d) - 1;
++  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
++  return era * 146097 + static_cast<int>(doe) - 719468;
++}
++
++// Weekday with Monday = 0 ... Sunday = 6 for a day number from daysFromCivil.
++inline int weekdayMonFirst(int dayNumber) {
++  // 1970-01-01 was a Thursday (index 3 with Monday = 0).
++  int w = (dayNumber + 3) % 7;
++  if (w < 0) w += 7;
++  return w;
++}
++
++}  // namespace civil
+diff --git a/src/util/SunTimes.h b/src/util/SunTimes.h
+new file mode 100644
+index 0000000..04aed37
+--- /dev/null
++++ b/src/util/SunTimes.h
+@@ -0,0 +1,36 @@
++#pragma once
++
++#include <cmath>
++
++// Offline sunrise/sunset (NOAA general solar position equations, accurate to
++// about a minute at mid latitudes). Pure math: no clock, no network.
++
++struct SunTimes {
++  bool valid = false;
++  int riseMin = 0;  // minutes after local midnight
++  int setMin = 0;
++};
++
++inline SunTimes computeSunTimes(float latDeg, float lonDeg, int year, int month, int day, int utcOffsetMin) {
++  static const int cum[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
++  const bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
++  const int doy = cum[month - 1] + day + ((leap && month > 2) ? 1 : 0);
++
++  const double kPi = 3.14159265358979323846;
++  const double g = 2.0 * kPi / (leap ? 366.0 : 365.0) * (doy - 1);
++  const double eqTime = 229.18 * (0.000075 + 0.001868 * std::cos(g) - 0.032077 * std::sin(g) -
++                                  0.014615 * std::cos(2 * g) - 0.040849 * std::sin(2 * g));
++  const double decl = 0.006918 - 0.399912 * std::cos(g) + 0.070257 * std::sin(g) - 0.006758 * std::cos(2 * g) +
++                      0.000907 * std::sin(2 * g) - 0.002697 * std::cos(3 * g) + 0.00148 * std::sin(3 * g);
++  const double lat = latDeg * kPi / 180.0;
++  double c = std::cos(90.833 * kPi / 180.0) / (std::cos(lat) * std::cos(decl)) - std::tan(lat) * std::tan(decl);
++  SunTimes out;
++  if (c < -1.0 || c > 1.0) return out;  // polar day/night: no rise/set
++  const double haDeg = std::acos(c) * 180.0 / kPi;
++  const double riseUtc = 720.0 - 4.0 * (lonDeg + haDeg) - eqTime;
++  const double setUtc = 720.0 - 4.0 * (lonDeg - haDeg) - eqTime;
++  out.riseMin = static_cast<int>(std::lround(riseUtc)) + utcOffsetMin;
++  out.setMin = static_cast<int>(std::lround(setUtc)) + utcOffsetMin;
++  out.valid = true;
++  return out;
++}
