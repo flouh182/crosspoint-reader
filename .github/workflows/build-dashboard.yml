@@ -1,0 +1,68 @@
+name: Build Dashboard firmware (X4 Pro)
+
+# Manual trigger: Actions tab -> "Build Dashboard firmware (X4 Pro)" -> Run workflow.
+# Expects dashboard-home.patch in the repository root.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Apply dashboard patch
+        run: |
+          set -euo pipefail
+          git apply --check dashboard-home.patch
+          git apply dashboard-home.patch
+          git status --short
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "latest"
+          enable-cache: false
+
+      - name: Install PlatformIO Core
+        run: |
+          uv pip install --system -U https://github.com/pioarduino/platformio-core/archive/refs/tags/v6.1.19.zip
+          uv pip install --system -U "littlefs-python>=0.16.0" "fatfs-ng>=0.1.14" "pyyaml>=6.0.2" \
+            "rich-click>=1.8.6" "zopfli>=0.2.2" "intelhex>=2.3.0" "rich>=14.0.0" "urllib3<2" \
+            "cryptography>=45.0.3" "certifi>=2025.8.3" "ecdsa>=0.19.1" "bitstring>=4.3.1" \
+            "reedsolo>=1.5.3,<1.8" "esp-idf-size>=2.0.0" "esp-coredump>=1.14.0"
+
+      - name: Cache PlatformIO packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-dashboard-${{ runner.os }}-x4pro-${{ hashFiles('platformio.ini') }}
+          restore-keys: pio-dashboard-${{ runner.os }}-x4pro-
+
+      - name: Pin pioarduino core inside the platform penv
+        run: |
+          set -euo pipefail
+          pio pkg install -e x4pro
+          uv pip install --python ~/.platformio/penv/bin/python "pioarduino==6.1.19"
+          ~/.platformio/penv/bin/pio --version
+
+      - name: Build x4pro firmware
+        run: |
+          set -euo pipefail
+          pio run -e x4pro | tee pio.log
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v6
+        with:
+          name: firmware-x4pro-dashboard
+          path: .pio/build/x4pro/firmware.bin
+          if-no-files-found: error
