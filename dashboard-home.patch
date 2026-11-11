@@ -37,10 +37,10 @@ index 68a1d99..e1a4dba 100644
    // IMAGES_DISPLAY but draws them as a B/W dither, so image pages skip the
 diff --git a/src/ReadingStats.cpp b/src/ReadingStats.cpp
 new file mode 100644
-index 0000000..82a80b4
+index 0000000..cc91970
 --- /dev/null
 +++ b/src/ReadingStats.cpp
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,103 @@
 +#include "ReadingStats.h"
 +
 +#include <Arduino.h>
@@ -48,7 +48,9 @@ index 0000000..82a80b4
 +#include <HalStorage.h>
 +#include <Logging.h>
 +
++#include <algorithm>
 +#include <cstring>
++#include <iterator>
 +#include <ctime>
 +
 +#include "util/CivilDate.h"
@@ -71,7 +73,7 @@ index 0000000..82a80b4
 +void ReadingStats::ensureLoaded() {
 +  if (loaded) return;
 +  loaded = true;
-+  for (auto& e : entries) e = {-1, 0};
++  std::fill(std::begin(entries), std::end(entries), Entry{-1, 0});
 +
 +  HalFile f;
 +  if (!Storage.openFileForRead("STATS", STATS_PATH, f)) return;
@@ -138,14 +140,13 @@ index 0000000..82a80b4
 +
 +uint32_t ReadingStats::secondsOnDay(int dayNumber) {
 +  ensureLoaded();
-+  for (const auto& e : entries) {
-+    if (e.day == dayNumber) return e.seconds;
-+  }
-+  return 0;
++  const auto* it = std::find_if(std::begin(entries), std::end(entries),
++                                [dayNumber](const Entry& e) { return e.day == dayNumber; });
++  return it != std::end(entries) ? it->seconds : 0;
 +}
 diff --git a/src/ReadingStats.h b/src/ReadingStats.h
 new file mode 100644
-index 0000000..75a586b
+index 0000000..17079f3
 --- /dev/null
 +++ b/src/ReadingStats.h
 @@ -0,0 +1,44 @@
@@ -181,7 +182,7 @@ index 0000000..75a586b
 +  };
 +  static constexpr uint32_t MAGIC = 0x41545352;  // "RSTA"
 +
-+  Entry entries[KEPT_DAYS];
++  Entry entries[KEPT_DAYS] = {};
 +  bool loaded = false;
 +  bool inSession = false;
 +  unsigned long sessionStartMs = 0;
