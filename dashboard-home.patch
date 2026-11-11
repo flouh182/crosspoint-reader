@@ -37,7 +37,7 @@ index 68a1d99..e1a4dba 100644
    // IMAGES_DISPLAY but draws them as a B/W dither, so image pages skip the
 diff --git a/src/ReadingStats.cpp b/src/ReadingStats.cpp
 new file mode 100644
-index 0000000..cc91970
+index 0000000..b1238cd
 --- /dev/null
 +++ b/src/ReadingStats.cpp
 @@ -0,0 +1,103 @@
@@ -50,8 +50,8 @@ index 0000000..cc91970
 +
 +#include <algorithm>
 +#include <cstring>
-+#include <iterator>
 +#include <ctime>
++#include <iterator>
 +
 +#include "util/CivilDate.h"
 +
@@ -140,8 +140,8 @@ index 0000000..cc91970
 +
 +uint32_t ReadingStats::secondsOnDay(int dayNumber) {
 +  ensureLoaded();
-+  const auto* it = std::find_if(std::begin(entries), std::end(entries),
-+                                [dayNumber](const Entry& e) { return e.day == dayNumber; });
++  const auto* it =
++      std::find_if(std::begin(entries), std::end(entries), [dayNumber](const Entry& e) { return e.day == dayNumber; });
 +  return it != std::end(entries) ? it->seconds : 0;
 +}
 diff --git a/src/ReadingStats.h b/src/ReadingStats.h
@@ -195,18 +195,20 @@ index 0000000..17079f3
 +extern ReadingStats readingStats;
 +#define READING_STATS readingStats
 diff --git a/src/SettingsList.h b/src/SettingsList.h
-index 4832128..4c530ea 100644
+index 4832128..199ea7a 100644
 --- a/src/SettingsList.h
 +++ b/src/SettingsList.h
-@@ -251,9 +251,11 @@ inline SettingInfo buildShortPowerButtonSetting() {
+@@ -250,10 +250,12 @@ inline SettingInfo buildShortPowerButtonSetting() {
+ }
  
  inline std::vector<StrId> homeThemeValues() {
-   static constexpr StrId VALUES[] = {StrId::STR_THEME_CLASSIC, StrId::STR_THEME_LYRA, StrId::STR_THEME_LYRA_EXTENDED,
+-  static constexpr StrId VALUES[] = {StrId::STR_THEME_CLASSIC, StrId::STR_THEME_LYRA, StrId::STR_THEME_LYRA_EXTENDED,
 -                                     StrId::STR_THEME_ROUNDEDRAFF, StrId::STR_THEME_COVER_GRID};
 -  const size_t count = UITheme::supportsCoverGrid() ? std::size(VALUES) : std::size(VALUES) - 1;
 -  return {VALUES, VALUES + count};
-+                                     StrId::STR_THEME_ROUNDEDRAFF, StrId::STR_THEME_COVER_GRID,
-+                                     StrId::STR_THEME_DASHBOARD};
++  static constexpr StrId VALUES[] = {StrId::STR_THEME_CLASSIC,       StrId::STR_THEME_LYRA,
++                                     StrId::STR_THEME_LYRA_EXTENDED, StrId::STR_THEME_ROUNDEDRAFF,
++                                     StrId::STR_THEME_COVER_GRID,    StrId::STR_THEME_DASHBOARD};
 +  // Entry order must match CrossPointSettings::UI_THEME. Cover Grid falls back
 +  // to Lyra on boards that do not support it (see UITheme::setTheme).
 +  return {VALUES, VALUES + std::size(VALUES)};
@@ -214,7 +216,7 @@ index 4832128..4c530ea 100644
  
  using SettingVisitor = void (*)(void* context, SettingInfo& info);
 diff --git a/src/activities/home/HomeActivity.cpp b/src/activities/home/HomeActivity.cpp
-index 1583fa7..1236827 100644
+index 1583fa7..0e3cd93 100644
 --- a/src/activities/home/HomeActivity.cpp
 +++ b/src/activities/home/HomeActivity.cpp
 @@ -4,6 +4,7 @@
@@ -233,19 +235,20 @@ index 1583fa7..1236827 100644
  #include "components/UITheme.h"
  #include "fontIds.h"
  
-@@ -251,6 +253,11 @@ void HomeActivity::onEnter() {
+@@ -251,6 +253,12 @@ void HomeActivity::onEnter() {
  
    const auto base = static_cast<int>(recentBooks.size());
    selectorIndex = initialMenuItem == HomeMenuItem::NONE ? 0 : base + menuItemToIndex(initialMenuItem, hasLibrarySlot());
 +  if (dashboardActive()) {
-+    selectorIndex = initialMenuItem == HomeMenuItem::SETTINGS_MENU ? DashboardHome::TILE_SETTINGS : DashboardHome::TILE_BOOKSHELF;
++    selectorIndex =
++        initialMenuItem == HomeMenuItem::SETTINGS_MENU ? DashboardHome::TILE_SETTINGS : DashboardHome::TILE_BOOKSHELF;
 +    uint8_t h = 0, m = 255;
 +    if (halClock.isAvailable() && halClock.getTime(h, m)) lastDrawnMinute = m;
 +  }
  
    // Trigger first update
    requestUpdate();
-@@ -303,6 +310,10 @@ void HomeActivity::freeCoverBuffer() {
+@@ -303,6 +311,10 @@ void HomeActivity::freeCoverBuffer() {
  }
  
  void HomeActivity::loop() {
@@ -256,7 +259,7 @@ index 1583fa7..1236827 100644
    const int menuCount = getMenuItemCount();
    const auto& metrics = UITheme::getInstance().getMetrics();
  
-@@ -473,6 +484,10 @@ void HomeActivity::render(RenderLock&&) {
+@@ -473,6 +485,10 @@ void HomeActivity::render(RenderLock&&) {
    const Rect content = UITheme::getInstance().getContentArea(renderer);
  
    renderer.clearScreen();
@@ -267,7 +270,7 @@ index 1583fa7..1236827 100644
    if (coverGridUi) {
      const auto drawGrid = [&] {
        renderer.clearScreen();
-@@ -592,3 +607,72 @@ void HomeActivity::onFileTransferOpen() { activityManager.goToFileTransfer(); }
+@@ -592,3 +608,72 @@ void HomeActivity::onFileTransferOpen() { activityManager.goToFileTransfer(); }
  void HomeActivity::onOpdsBrowserOpen() { activityManager.goToBrowser(); }
  
  void HomeActivity::onPluginsOpen() { activityManager.goToPlugins(hasOpdsServers); }
@@ -333,8 +336,8 @@ index 1583fa7..1236827 100644
 +void HomeActivity::renderDashboard() {
 +  DashboardHome::draw(renderer, selectorIndex);
 +
-+  const auto labels = mappedInput.mapLabels(hasContinueReading ? tr(STR_RESUME) : "", tr(STR_SELECT), tr(STR_DIR_UP),
-+                                            tr(STR_DIR_DOWN));
++  const auto labels =
++      mappedInput.mapLabels(hasContinueReading ? tr(STR_RESUME) : "", tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
 +  GUI.drawButtonHints(renderer, labels.btn1, labels.btn2, labels.btn3, labels.btn4);
 +
 +  renderer.displayBuffer(cleanInitialRefresh && !firstRenderDone ? HalDisplay::HALF_REFRESH : HalDisplay::FAST_REFRESH);
@@ -388,7 +391,7 @@ index 12584d1..05fca42 100644
      fontCache->releaseSdFontCaches();
 diff --git a/src/components/DashboardHome.cpp b/src/components/DashboardHome.cpp
 new file mode 100644
-index 0000000..38df8e6
+index 0000000..5086ec0
 --- /dev/null
 +++ b/src/components/DashboardHome.cpp
 @@ -0,0 +1,356 @@
@@ -429,7 +432,7 @@ index 0000000..38df8e6
 +
 +struct Clock {
 +  bool valid = false;
-+  struct tm t {};
++  struct tm t{};
 +};
 +
 +// UTC offset (minutes) currently in effect for the configured timezone,
@@ -437,7 +440,7 @@ index 0000000..38df8e6
 +int utcOffsetMinutes(const struct tm& local) {
 +  struct tm copy = local;
 +  const time_t epoch = mktime(&copy);  // interprets `copy` under the active TZ rule
-+  struct tm utc {};
++  struct tm utc{};
 +  gmtime_r(&epoch, &utc);
 +  int diff = (local.tm_hour - utc.tm_hour) * 60 + (local.tm_min - utc.tm_min);
 +  const int dayDiff = local.tm_yday - utc.tm_yday;
@@ -494,13 +497,13 @@ index 0000000..38df8e6
 +void drawSegDigit(const GfxRenderer& r, int x, int y, int dw, int dh, int t, int digit) {
 +  const uint8_t m = kSegMask[digit < 0 || digit > 10 ? 10 : digit];
 +  const int half = (dh - 3 * t) / 2;
-+  if (m & 1) r.fillRect(x + t, y, dw - 2 * t, t, true);                         // a
-+  if (m & 2) r.fillRect(x + dw - t, y + t, t, half, true);                      // b
-+  if (m & 4) r.fillRect(x + dw - t, y + 2 * t + half, t, half, true);          // c
-+  if (m & 8) r.fillRect(x + t, y + dh - t, dw - 2 * t, t, true);               // d
-+  if (m & 16) r.fillRect(x, y + 2 * t + half, t, half, true);                  // e
-+  if (m & 32) r.fillRect(x, y + t, t, half, true);                             // f
-+  if (m & 64) r.fillRect(x + t, y + t + half, dw - 2 * t, t, true);            // g
++  if (m & 1) r.fillRect(x + t, y, dw - 2 * t, t, true);                // a
++  if (m & 2) r.fillRect(x + dw - t, y + t, t, half, true);             // b
++  if (m & 4) r.fillRect(x + dw - t, y + 2 * t + half, t, half, true);  // c
++  if (m & 8) r.fillRect(x + t, y + dh - t, dw - 2 * t, t, true);       // d
++  if (m & 16) r.fillRect(x, y + 2 * t + half, t, half, true);          // e
++  if (m & 32) r.fillRect(x, y + t, t, half, true);                     // f
++  if (m & 64) r.fillRect(x + t, y + t + half, dw - 2 * t, t, true);    // g
 +}
 +
 +void drawFlipCard(const GfxRenderer& r, int x, int y, int w, int h, int value /*0-99, -1 = dashes*/) {
@@ -591,8 +594,7 @@ index 0000000..38df8e6
 +}
 +
 +// ------------------------------------------------------------------- tiles
-+void drawTile(const GfxRenderer& r, int x, int y, int w, int h, const uint8_t* icon, const char* label,
-+              bool selected) {
++void drawTile(const GfxRenderer& r, int x, int y, int w, int h, const uint8_t* icon, const char* label, bool selected) {
 +  frame(r, x, y, w, h, selected ? 5 : 2);
 +  const int lh = r.getLineHeight(UI_10_FONT_ID);
 +  const int iconSize = 32;
@@ -656,7 +658,8 @@ index 0000000..38df8e6
 +  }
 +  if (sun.valid && nowMin >= sun.riseMin && nowMin <= sun.setMin && sun.setMin > sun.riseMin) {
 +    const double f = static_cast<double>(nowMin - sun.riseMin) / (sun.setMin - sun.riseMin);
-+    drawOctagon(r, x0 + static_cast<int>((x1 - x0) * f), baseY - static_cast<int>(std::lround(amp * std::sin(kPi * f))), 6);
++    drawOctagon(r, x0 + static_cast<int>((x1 - x0) * f), baseY - static_cast<int>(std::lround(amp * std::sin(kPi * f))),
++                6);
 +  }
 +
 +  char rise[8] = "--:--", set[8] = "--:--";
